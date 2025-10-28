@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Auto-pick the fastest WireGuard profile using your existing wg-switch
+# Auto-pick the fastest WireGuard profile and ensure only one interface at a time
 set -euo pipefail
 
 PROFILES=(uk-lon uk-man nl-ams de-ber us-nyc)
@@ -16,20 +16,33 @@ ping_avg_ms() { p=$(ping -c 3 -w 5 "$PING_TARGET" 2>/dev/null | awk -F'/' '/^rtt
 
 require curl; require ping; require awk; require python3
 
+# --- Bring all existing WG interfaces down (clean slate)
+down_all() {
+  for i in $(sudo wg show interfaces 2>/dev/null || true); do
+    sudo wg-quick down "$i" >/dev/null 2>&1 || true
+  done
+}
+
 declare -A SPEED LAT
 current_profile=""; current_speed="0"
 [[ -f "$STATE_FILE" ]] && read -r current_profile current_speed < "$STATE_FILE" || true
 
+echo "wg-autopick: evaluating ${PROFILES[*]}"
+
 for prof in "${PROFILES[@]}"; do
-  conf="/etc/wireguard/${prof}.conf"
-  [[ -f "$conf" ]] || { echo "skip $prof (missing $conf)"; continue; }
-  sudo wg-quick down wg0 >/dev/null 2>&1 || true
-  if ! sudo wg-quick up "$conf" >/dev/null 2>&1; then echo "fail up $prof"; continue; fi
+  [[ -f "/etc/wireguard/${prof}.conf" ]] || { echo "skip $prof (no conf)"; continue; }
+
+  down_all
+  if ! sudo wg-quick up "$prof" >/dev/null 2>&1; then
+    echo "fail up $prof"; continue
+  fi
   sleep "$UP_STABILISE"
+
   LAT["$prof"]="$(ping_avg_ms)"
   SPEED["$prof"]="$(speed_test)"
   echo "$prof speed=${SPEED[$prof]}B/s lat=${LAT[$prof]}ms"
-  sudo wg-quick down wg0 >/dev/null 2>&1 || true
+
+  sudo wg-quick down "$prof" >/dev/null 2>&1 || true
 done
 
 best_prof=""; best_speed="0"; best_lat="9999"
@@ -60,10 +73,12 @@ PY
   (( gain < HYSTERESIS_PCT )) && switch=0
 fi
 
+down_all
 if (( switch )); then
   echo "switch -> $best_prof"
-  sudo /usr/local/sbin/wg-switch "$best_prof"
+  sudo wg-quick up "$best_prof"
   echo "$best_prof $best_speed" | sudo tee "$STATE_FILE" >/dev/null
 else
   echo "stay on $current_profile"
+  [[ -n "$current_profile" ]] && sudo wg-quick up "$current_profile" || true
 fi
