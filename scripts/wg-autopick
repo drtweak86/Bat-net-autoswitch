@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Auto-pick the fastest WireGuard profile and ensure only one interface at a time
 set -euo pipefail
 
 PROFILES=(uk-lon uk-man nl-ams de-ber us-nyc)
@@ -16,7 +15,6 @@ ping_avg_ms() { p=$(ping -c 3 -w 5 "$PING_TARGET" 2>/dev/null | awk -F'/' '/^rtt
 
 require curl; require ping; require awk; require python3
 
-# --- Bring all existing WG interfaces down (clean slate)
 down_all() {
   for i in $(sudo wg show interfaces 2>/dev/null || true); do
     sudo wg-quick down "$i" >/dev/null 2>&1 || true
@@ -34,7 +32,8 @@ for prof in "${PROFILES[@]}"; do
 
   down_all
   if ! sudo wg-quick up "$prof" >/dev/null 2>&1; then
-    echo "fail up $prof"; continue
+    echo "fail up $prof"
+    continue
   fi
   sleep "$UP_STABILISE"
 
