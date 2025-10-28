@@ -1,151 +1,69 @@
 #!/usr/bin/env bash
-# Auto-pick the fastest WireGuard profile
-# Requires: curl, ping, sudo; uses your existing /usr/local/sbin/wg-switch
+# Auto-pick the fastest WireGuard profile using your existing wg-switch
 set -euo pipefail
 
-# ---------- Config ----------
-# Profiles to test (basename without .conf). Adjust if you add/remove files.
 PROFILES=(uk-lon uk-man nl-ams de-ber us-nyc)
-
-# Quick test target: small/short download from a reliable CDN.
-# We fetch ~20 MB but stop early by timeout; we only need an indicative speed.
 TEST_URL="https://speed.cloudflare.com/__down?bytes=20000000"
-TEST_TIMEOUT=7            # seconds for each curl speed test
-PING_TARGET="1.1.1.1"     # latency target
-COOLDOWN_FILE="/run/wg-autopick.lock"
-STATE_FILE="/run/wg-autopick.state"  # remembers last pick & its speed
-HYSTERESIS_PCT=15         # only switch if new is >=15% faster than current
-UP_STABILISE=3            # seconds to wait after bringing up a profile
+TEST_TIMEOUT=7
+PING_TARGET="1.1.1.1"
+STATE_FILE="/run/wg-autopick.state"
+HYSTERESIS_PCT=15
+UP_STABILISE=3
 
-# ---------- Helpers ----------
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing $1"; exit 1; }; }
-speed_test() {
-  # Prints bytes/sec (float) to stdout or 0 on failure
-  curl -m "$TEST_TIMEOUT" -s -o /dev/null -w '%{speed_download}' "$TEST_URL" || echo "0"
-}
-ping_avg_ms() {
-  # Prints average RTT in ms (float) or big number on failure
-  local p
-  p=$(ping -c 3 -w 5 "$PING_TARGET" 2>/dev/null | awk -F'/' '/^rtt|^round-trip/ {print $5}')
-  [[ -n "$p" ]] && echo "$p" || echo "9999"
-}
-pct_faster() {
-  # usage: pct_faster new old --> integer (percentage)
-  # if old <= 0, return 100
-  local new="$1" old="$2"
-  if (( $(echo "$old <= 0" | bc -l) )); then echo 100; else
-    python3 - <<PY
-n=$new;o=$old
-print(int(((n-o)/o)*100))
-PY
-  fi
-}
+speed_test() { curl -m "$TEST_TIMEOUT" -s -o /dev/null -w '%{speed_download}' "$TEST_URL" || echo "0"; }
+ping_avg_ms() { p=$(ping -c 3 -w 5 "$PING_TARGET" 2>/dev/null | awk -F'/' '/^rtt|^round-trip/ {print $5}'); echo "${p:-9999}"; }
 
-# ---------- Sanity ----------
-require curl
-require awk
-require ping
-require bc || true        # only needed for a tiny compare; we fallback to python3
-require python3
+require curl; require ping; require awk; require python3
 
-# Ensure single run
-exec 9>"$COOLDOWN_FILE" || true
-flock -n 9 || { echo "wg-autopick already running"; exit 0; }
-
-# ---------- Iterate profiles ----------
-declare -A SPEED  # bytes/sec
-declare -A LAT    # ms
-
-# Remember current for hysteresis decision
-current_profile=""
-current_speed="0"
-
-if [[ -f "$STATE_FILE" ]]; then
-  # STATE_FILE format: "<profile> <speed_bytes_per_sec>"
-  read -r current_profile current_speed < "$STATE_FILE" || true
-fi
-
-echo "wg-autopick: evaluating profiles: ${PROFILES[*]}"
+declare -A SPEED LAT
+current_profile=""; current_speed="0"
+[[ -f "$STATE_FILE" ]] && read -r current_profile current_speed < "$STATE_FILE" || true
 
 for prof in "${PROFILES[@]}"; do
   conf="/etc/wireguard/${prof}.conf"
-  if [[ ! -f "$conf" ]]; then
-    echo "Skipping $prof (missing $conf)"
-    continue
-  fi
-
-  echo "Testing $prof ..."
-  # Bring up this profile
+  [[ -f "$conf" ]] || { echo "skip $prof (missing $conf)"; continue; }
   sudo wg-quick down wg0 >/dev/null 2>&1 || true
-  if ! sudo wg-quick up "$conf" >/dev/null 2>&1; then
-    echo "  failed to bring up $prof; skipping"
-    continue
-  fi
+  if ! sudo wg-quick up "$conf" >/dev/null 2>&1; then echo "fail up $prof"; continue; fi
   sleep "$UP_STABILISE"
-
-  # Measure
   LAT["$prof"]="$(ping_avg_ms)"
   SPEED["$prof"]="$(speed_test)"
-
-  echo "  speed=${SPEED[$prof]} B/s  latency=${LAT[$prof]} ms"
-
-  # Tear it down again before next test
+  echo "$prof speed=${SPEED[$prof]}B/s lat=${LAT[$prof]}ms"
   sudo wg-quick down wg0 >/dev/null 2>&1 || true
 done
 
-# ---------- Choose best ----------
-best_prof=""
-best_speed="0"
-best_lat="9999"
-
+best_prof=""; best_speed="0"; best_lat="9999"
 for prof in "${!SPEED[@]}"; do
-  s="${SPEED[$prof]}"
-  l="${LAT[$prof]}"
-  # Primary key: highest speed; tie-break: lowest latency
-  better_speed=$(python3 - <<PY
+  s="${SPEED[$prof]}"; l="${LAT[$prof]}"
+  if python3 - <<PY >/dev/null 2>&1
 s=float("$s"); b=float("$best_speed")
-print(1 if s>b else 0)
+import sys; sys.exit(0 if s>b else 1)
 PY
-)
-  if [[ "$better_speed" == "1" ]]; then
-    best_prof="$prof"; best_speed="$s"; best_lat="$l"
-  elif [[ "$s" == "$best_speed" ]]; then
-    better_lat=$(python3 - <<PY
+  then best_prof="$prof"; best_speed="$s"; best_lat="$l"
+  elif [[ "$s" == "$best_speed" ]] && python3 - <<PY >/dev/null 2>&1
 l=float("$l"); b=float("$best_lat")
-print(1 if l<b else 0)
+import sys; sys.exit(0 if l<b else 1)
 PY
-)
-    if [[ "$better_lat" == "1" ]]; then
-      best_prof="$prof"; best_speed="$s"; best_lat="$l"
-    fi
-  fi
+  then best_prof="$prof"; best_speed="$s"; best_lat="$l"; fi
 done
 
-if [[ -z "$best_prof" ]]; then
-  echo "No usable profiles found."
-  exit 1
-fi
+[[ -n "$best_prof" ]] || { echo "no usable profiles"; exit 1; }
 
-echo "Best: $best_prof  speed=$best_speed B/s  lat=$best_lat ms"
-
-# ---------- Hysteresis: only switch if worth it ----------
-should_switch=1
+switch=1
 if [[ -n "$current_profile" && "$current_profile" != "$best_prof" ]]; then
-  gain=$(pct_faster "$best_speed" "$current_speed")
-  echo "Current=$current_profile ($current_speed B/s), gain vs best=$gain%"
-  if (( gain < HYSTERESIS_PCT )); then
-    echo "Change < ${HYSTERESIS_PCT}% → keeping current profile."
-    should_switch=0
-  fi
+  gain=$(python3 - <<PY
+n=float("$best_speed"); o=float("$current_speed") if "$current_speed" not in ("","0") else 0.0
+print(int(((n-o)/o)*100) if o>0 else 100)
+PY
+)
+  echo "current=$current_profile ($current_speed B/s), gain=${gain}%"
+  (( gain < HYSTERESIS_PCT )) && switch=0
 fi
 
-# ---------- Switch ----------
-if (( should_switch )); then
-  echo "Switching to $best_prof ..."
+if (( switch )); then
+  echo "switch -> $best_prof"
   sudo /usr/local/sbin/wg-switch "$best_prof"
   echo "$best_prof $best_speed" | sudo tee "$STATE_FILE" >/dev/null
 else
-  echo "Staying on $current_profile"
+  echo "stay on $current_profile"
 fi
-
-exit 0
