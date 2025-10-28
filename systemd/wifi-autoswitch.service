@@ -1,0 +1,13 @@
+[Unit]
+Description=Bat-Net Auto Switch (OSMC)
+After=network-online.target connman.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wifi_autoswitch.sh
+User=osmc
+Group=osmc
+
+[Install]
+WantedBy=multi-user.target

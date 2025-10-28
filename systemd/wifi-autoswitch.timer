@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Bat-Net Auto Switch every 2 minutes
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=120
+AccuracySec=15s
+Persistent=true
+Unit=wifi-autoswitch.service
+
+[Install]
+WantedBy=timers.target
