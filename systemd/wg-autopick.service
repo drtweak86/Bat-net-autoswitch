@@ -1,0 +1,14 @@
+[Unit]
+Description=Auto-pick fastest WireGuard profile
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wg-autopick
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target
